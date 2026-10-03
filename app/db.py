@@ -33,9 +33,16 @@
   不同理由冲突); 提交即冻结该标号在快照中的评分与评语并发放随机查询凭据
   (obj- 前缀, query_token 全局唯一), 持凭据可随时查看处理状态, 与访问码此后是否
   失效无关; state: pending(待处理) / rejected(驳回, 不影响快照) / accepted(受理,
-  已走既有评语更正请求流程) / expired(发布序号变化后未处理异议过期, 仅供会务方追溯);
-  每次发布 (含补位发布) 推进发布序号时, 旧序号下仍 pending 的异议在同一事务内
-  原子标记 expired, 历史行永久保留;
+  已走既有评语更正请求流程) / expired(发布序号变化或论文撤回后未处理异议过期,
+  仅供会务方追溯); 每次发布 (含补位发布) 推进发布序号时, 旧序号下仍 pending 的
+  异议在同一事务内原子标记 expired, 历史行永久保留;
+- papers.withdrawn 标记论文是否已被会务方撤回 (1=已撤回): 撤回在同一个写事务内
+  生效——立即停止评审人取稿/确认/回避/提交评语与更正、该稿全部反馈访问码失效、
+  待处理异议原子过期、普通分配锁定行随撤回清除; 撤回稿不进入后续普通分配与补位,
+  同编号不能重新录入, 也不能再更新/删除 (资料行与全部评审痕迹保留供会务方追溯)。
+  paper_withdrawals 表每篇撤回稿至多一行, 保存非空撤回原因、推进后的资料修订号、
+  撤回时间及撤回瞬间的发布序号与槽位 (供追溯); 匹配当前修订号的同原因重试幂等
+  返回原记录 (不推进修订号), 异原因/版本不符拒绝且无部分改动。
 - 发布 = 在同一个写事务内 "校验修订号 -> 重算 -> 写入",
   因此与资料修改并发时不会产生基于旧版资料的方案。
 """
@@ -57,7 +64,8 @@ CREATE TABLE IF NOT EXISTS papers (
     paper_id     TEXT PRIMARY KEY,
     manuscript   TEXT NOT NULL,
     topics       TEXT NOT NULL,   -- JSON array
-    institutions TEXT NOT NULL    -- JSON array
+    institutions TEXT NOT NULL,   -- JSON array
+    withdrawn    INTEGER NOT NULL DEFAULT 0  -- 1=已撤回 (资料行保留, 同编号不可再录入)
 );
 CREATE TABLE IF NOT EXISTS reviewers (
     reviewer_id  TEXT PRIMARY KEY,
@@ -222,6 +230,23 @@ CREATE TABLE IF NOT EXISTS feedback_objections (
     decided_at         TEXT,                -- 驳回/受理时间; 序号变化过期时同事务写入
     UNIQUE (snapshot_id, label)
 );
+-- 论文撤回记录 (会务方凭密钥撤回, 每篇撤回稿至多一行)。
+-- 撤回在同一个写事务内生效: papers.withdrawn 置 1, 立即停止评审人取稿/确认/回避/
+-- 评语与更正, 该稿全部反馈快照访问码失效 (feedback_snapshots.invalidated=1),
+-- 仍 pending 的作者异议原子标记 expired, 普通分配锁定行随撤回清除
+-- (撤回稿不参与后续普通分配与补位, 其锁定不得阻塞其他论文);
+-- 资料行、已处理异议与评语、快照、分配/确认/更正历史均不删除, 冻结撤回瞬间的
+-- 发布序号与槽位 (published_serial / published_plan_json) 供会务方追溯。
+-- 撤回推进资料修订号 +1; 匹配当前修订号的同原因重试幂等返回原记录 (不推进修订号),
+-- 异原因或修订号不符一律拒绝且无部分改动。
+CREATE TABLE IF NOT EXISTS paper_withdrawals (
+    paper_id            TEXT PRIMARY KEY,
+    reason              TEXT NOT NULL,       -- 会务方填写的非空撤回原因
+    revision            INTEGER NOT NULL,    -- 撤回推进后的资料修订号
+    published_serial    INTEGER,             -- 撤回瞬间的发布序号 (从未发布为 NULL)
+    published_plan_json TEXT,                -- 撤回瞬间该稿的槽位 JSON: [评审人编号 ...]
+    withdrawn_at        TEXT NOT NULL
+);
 """
 
 
@@ -239,6 +264,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # 既有快照默认未被更正请求失效
         conn.execute(
             "ALTER TABLE feedback_snapshots ADD COLUMN invalidated INTEGER NOT NULL DEFAULT 0"
+        )
+    paper_cols = {r["name"] for r in conn.execute("PRAGMA table_info(papers)").fetchall()}
+    if "withdrawn" not in paper_cols:
+        # 既有论文均未撤回
+        conn.execute(
+            "ALTER TABLE papers ADD COLUMN withdrawn INTEGER NOT NULL DEFAULT 0"
         )
 
 
@@ -353,6 +384,21 @@ def expire_pending_objections(conn: sqlite3.Connection, new_serial: int, now: st
         "UPDATE feedback_objections SET state = 'expired', decided_at = ?"
         " WHERE state = 'pending' AND serial < ?",
         (now, new_serial),
+    ).rowcount
+
+
+def expire_pending_objections_for_paper(
+    conn: sqlite3.Connection, paper_id: str, now: str
+) -> int:
+    """论文撤回时, 在同一写事务内把该稿仍 pending 的作者异议标记过期。
+
+    撤回立即生效: 待处理异议不再可驳回/受理 (终态化), 已处理 (rejected/accepted)
+    与既已过期的异议保持不变; 全部历史保留供会务方追溯。返回过期条数。
+    """
+    return conn.execute(
+        "UPDATE feedback_objections SET state = 'expired', decided_at = ?"
+        " WHERE state = 'pending' AND paper_id = ?",
+        (now, paper_id),
     ).rowcount
 
 

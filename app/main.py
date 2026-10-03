@@ -27,6 +27,7 @@ from .schemas import (
     LockTableIn,
     PaperIn,
     PaperUpdate,
+    PaperWithdrawalIn,
     PublishIn,
     ReviewCorrectionRequestIn,
     ReviewCorrectionSubmitIn,
@@ -117,7 +118,11 @@ def _recused_pairs(conn):
 
 
 def _load_domain(conn):
-    """加载当前资料。评审人声明过的硬回避与其录入的 avoid_papers 合并后生效。"""
+    """加载当前资料。评审人声明过的硬回避与其录入的 avoid_papers 合并后生效。
+
+    已撤回的论文 (papers.withdrawn=1) 不进入后续普通分配与补位;
+    资料行保留供会务方追溯, 同编号不能重新录入。
+    """
     hard = _hard_recusals(conn)
     papers = [
         Paper(
@@ -125,7 +130,7 @@ def _load_domain(conn):
             topics=frozenset(json.loads(r["topics"])),
             institutions=frozenset(json.loads(r["institutions"])),
         )
-        for r in conn.execute("SELECT * FROM papers").fetchall()
+        for r in conn.execute("SELECT * FROM papers WHERE withdrawn = 0").fetchall()
     ]
     reviewers = []
     for r in conn.execute("SELECT * FROM reviewers").fetchall():
@@ -158,6 +163,22 @@ def _paper_row_to_dict(row):
         "manuscript": row["manuscript"],
         "topics": json.loads(row["topics"]),
         "institutions": json.loads(row["institutions"]),
+        "withdrawn": bool(row["withdrawn"]),
+    }
+
+
+def _withdrawal_view(row):
+    """撤回记录视图 (含撤回瞬间冻结的发布序号与槽位, 供会务方追溯)。"""
+    return {
+        "paper_id": row["paper_id"],
+        "state": "withdrawn",
+        "reason": row["reason"],
+        "revision": row["revision"],
+        "withdrawn_at": row["withdrawn_at"],
+        "published_serial": row["published_serial"],
+        "published_plan": (
+            json.loads(row["published_plan_json"]) if row["published_plan_json"] is not None else None
+        ),
     }
 
 
@@ -254,6 +275,8 @@ def _build_backfill(conn, published_row):
     fixed = _confirmed_map(plan, decisions)
     all_papers, all_reviewers = _load_domain(conn)
     paper_ids = {p.paper_id for p in all_papers}
+    # 撤回稿即使仍在当前发布版中也不补位 (已停止评审, 其槽位不补人, 不阻塞其他论文);
+    # _load_domain 已排除 withdrawn 论文, 这里的范围过滤自然将其剔除
     scoped_papers = [p for p in all_papers if p.paper_id in plan and p.paper_id in paper_ids]
     result = compute_backfill(
         scoped_papers,
@@ -348,7 +371,16 @@ def meta(_: bool = Depends(require_organizer)):
 @app.post("/papers", status_code=201)
 def create_paper(body: PaperIn, _: bool = Depends(require_organizer)):
     with db.write_txn() as conn:
-        if conn.execute("SELECT 1 FROM papers WHERE paper_id = ?", (body.paper_id,)).fetchone():
+        existing = conn.execute(
+            "SELECT withdrawn FROM papers WHERE paper_id = ?", (body.paper_id,)
+        ).fetchone()
+        if existing:
+            if existing["withdrawn"]:
+                # 撤回稿资料行保留供追溯, 同编号不能重新录入
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"论文编号 {body.paper_id} 已撤回: 撤回稿同编号不能重新录入",
+                )
             raise HTTPException(status_code=409, detail=f"论文编号重复: {body.paper_id}")
         conn.execute(
             "INSERT INTO papers(paper_id, manuscript, topics, institutions) VALUES (?,?,?,?)",
@@ -361,8 +393,16 @@ def create_paper(body: PaperIn, _: bool = Depends(require_organizer)):
 @app.put("/papers/{paper_id}")
 def update_paper(paper_id: str, body: PaperUpdate, _: bool = Depends(require_organizer)):
     with db.write_txn() as conn:
-        if not conn.execute("SELECT 1 FROM papers WHERE paper_id = ?", (paper_id,)).fetchone():
+        row = conn.execute(
+            "SELECT withdrawn FROM papers WHERE paper_id = ?", (paper_id,)
+        ).fetchone()
+        if not row:
             raise HTTPException(status_code=404, detail=f"论文不存在: {paper_id}")
+        if row["withdrawn"]:
+            raise HTTPException(
+                status_code=409,
+                detail=f"论文 {paper_id} 已撤回, 撤回稿不可再修改 (评审痕迹保留供追溯)",
+            )
         conn.execute(
             "UPDATE papers SET manuscript = ?, topics = ?, institutions = ? WHERE paper_id = ?",
             (body.manuscript, json.dumps(body.topics), json.dumps(body.institutions), paper_id),
@@ -374,6 +414,16 @@ def update_paper(paper_id: str, body: PaperUpdate, _: bool = Depends(require_org
 @app.delete("/papers/{paper_id}")
 def delete_paper(paper_id: str, _: bool = Depends(require_organizer)):
     with db.write_txn() as conn:
+        row = conn.execute(
+            "SELECT withdrawn FROM papers WHERE paper_id = ?", (paper_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"论文不存在: {paper_id}")
+        if row["withdrawn"]:
+            raise HTTPException(
+                status_code=409,
+                detail=f"论文 {paper_id} 已撤回, 撤回稿不可删除 (资料与评审痕迹保留供追溯)",
+            )
         cur = conn.execute("DELETE FROM papers WHERE paper_id = ?", (paper_id,))
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail=f"论文不存在: {paper_id}")
@@ -388,7 +438,164 @@ def delete_paper(paper_id: str, _: bool = Depends(require_organizer)):
 def list_papers(_: bool = Depends(require_organizer)):
     with db.read_txn() as conn:
         rows = conn.execute("SELECT * FROM papers ORDER BY paper_id").fetchall()
-    return {"papers": [_paper_row_to_dict(r) for r in rows]}
+        withdrawals = {
+            r["paper_id"]: r
+            for r in conn.execute("SELECT * FROM paper_withdrawals").fetchall()
+        }
+    papers = []
+    for r in rows:
+        item = _paper_row_to_dict(r)
+        w = withdrawals.get(r["paper_id"])
+        item["withdrawal"] = _withdrawal_view(w) if w else None
+        papers.append(item)
+    return {"papers": papers}
+
+
+# ---------------------------------------------------------------- 论文撤回 (会务方)
+
+@app.post("/papers/{paper_id}/withdrawal")
+def withdraw_paper(
+    paper_id: str,
+    body: PaperWithdrawalIn,
+    _: bool = Depends(require_organizer),
+):
+    """会务方撤回一篇现存论文。
+
+    凭现有密钥提交 论文编号 + 当前资料修订号 base_revision + 非空原因:
+      - 请求在同一个写事务内先核对修订号: 过期/超前 -> 409, 拒绝且无任何改动;
+      - 路径与请求体论文编号不一致 -> 422; 原因去首尾空白后为空 -> 422;
+      - 论文未知 (从未录入) -> 404;
+      - 该论文此前已撤回:
+          * 匹配当前修订号且原因相同 (首尾空白归一化) -> 幂等返回原撤回记录
+            (changed=false), 不推进修订号、不重复失效/过期;
+          * 原因不同 -> 409 冲突;
+          * 修订号不符在上一步即以 409 拒绝。
+    撤回在同一事务内生效:
+      - papers.withdrawn 置 1: 该稿立即停止评审人取稿、确认、回避、提交评语与更正,
+        且不进入后续普通分配与补位; 同编号不能重新录入, 也不可再更新/删除;
+      - 该稿全部反馈快照访问码立即失效 (持码者统一 404, 不透露论文状态);
+      - 该稿仍 pending 的作者异议原子标记 expired; 已处理异议、评语、快照、
+        决定/回避、更正记录与分配历史均保留, 冻结撤回瞬间发布序号与槽位供会务方追溯;
+      - 该稿普通分配锁定行随撤回清除 (撤回稿不参与分配, 其锁定不得阻塞其他论文);
+      - 撤回推进资料修订号 +1 (当前发布版与发布序号不变, 仍可供会务方核对,
+        作者原查询凭据仍可查状态)。
+    返回撤回状态、(推进后的) 修订号、撤回记录及本次失效快照数/过期异议数。
+    """
+    if body.paper_id != paper_id:
+        raise HTTPException(
+            status_code=422,
+            detail=f"路径中的论文编号 ({paper_id}) 与请求体 ({body.paper_id}) 不一致",
+        )
+    reason = body.reason.strip()
+    if not reason:
+        raise HTTPException(
+            status_code=422, detail="撤回原因必须非空 (non-empty withdrawal reason is required)"
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+    with db.write_txn() as conn:
+        rev = db.get_revision(conn)
+        if body.base_revision != rev:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"资料已变更: 撤回请求基于修订号 {body.base_revision},"
+                    f" 当前修订号为 {rev}, 请重新查看资料后再撤回"
+                ),
+            )
+        paper = conn.execute(
+            "SELECT withdrawn FROM papers WHERE paper_id = ?", (paper_id,)
+        ).fetchone()
+        if paper is None:
+            raise HTTPException(status_code=404, detail=f"论文不存在: {paper_id}")
+
+        existing = conn.execute(
+            "SELECT * FROM paper_withdrawals WHERE paper_id = ?", (paper_id,)
+        ).fetchone()
+        if existing is not None:
+            if existing["reason"] == reason:
+                # 匹配当前修订号的同原因重试: 幂等返回原记录, 不推进修订号、
+                # 不重复失效快照/过期异议
+                return {
+                    "ok": True,
+                    "paper_id": paper_id,
+                    "state": "withdrawn",
+                    "changed": False,
+                    "revision": rev,
+                    "withdrawal": _withdrawal_view(existing),
+                    "invalidated_snapshots": 0,
+                    "expired_objections": 0,
+                }
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "该论文已撤回且撤回原因不同, 重复撤回按冲突拒绝",
+                    "paper_id": paper_id,
+                    "existing_reason": existing["reason"],
+                    "existing_revision": existing["revision"],
+                },
+            )
+
+        # 冻结撤回瞬间的发布状态供会务方追溯 (当前发布版不修改、不推进发布序号)
+        published = _load_published(conn)
+        frozen_serial = None
+        frozen_plan = None
+        if published is not None:
+            pair = json.loads(published["plan"]).get(paper_id)
+            if pair is not None:
+                frozen_serial = published["serial"]
+                frozen_plan = json.dumps(pair, ensure_ascii=False)
+
+        conn.execute(
+            "UPDATE papers SET withdrawn = 1 WHERE paper_id = ?", (paper_id,)
+        )
+        # 该稿全部反馈快照访问码立即失效 (旧版/当前版统一失效, 快照行保留供追溯)
+        invalidated_snapshots = conn.execute(
+            "UPDATE feedback_snapshots SET invalidated = 1"
+            " WHERE paper_id = ? AND invalidated = 0",
+            (paper_id,),
+        ).rowcount
+        # 待处理异议原子过期; 已处理 (rejected/accepted) 与已过期异议保持终态
+        expired_objections = db.expire_pending_objections_for_paper(conn, paper_id, now)
+        # 撤回稿不参与后续分配: 锁定行随撤回清除, 绝不以撤回稿的锁定阻塞其他论文
+        conn.execute("DELETE FROM assignment_locks WHERE paper_id = ?", (paper_id,))
+        new_rev = db.bump_revision(conn)
+        conn.execute(
+            "INSERT INTO paper_withdrawals"
+            "(paper_id, reason, revision, published_serial, published_plan_json, withdrawn_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (paper_id, reason, new_rev, frozen_serial, frozen_plan, now),
+        )
+        record = conn.execute(
+            "SELECT * FROM paper_withdrawals WHERE paper_id = ?", (paper_id,)
+        ).fetchone()
+    return {
+        "ok": True,
+        "paper_id": paper_id,
+        "state": "withdrawn",
+        "changed": True,
+        "revision": new_rev,
+        "withdrawal": _withdrawal_view(record),
+        "invalidated_snapshots": invalidated_snapshots,
+        "expired_objections": expired_objections,
+    }
+
+
+@app.get("/papers/{paper_id}/withdrawal")
+def get_paper_withdrawal(paper_id: str, _: bool = Depends(require_organizer)):
+    """会务方查看某篇论文的撤回记录 (撤回状态、原因、修订号、时间与冻结发布槽位)。
+
+    论文未知或尚未撤回统一 404; 撤回记录长期保留供会务方追溯。
+    """
+    with db.read_txn() as conn:
+        record = conn.execute(
+            "SELECT * FROM paper_withdrawals WHERE paper_id = ?", (paper_id,)
+        ).fetchone()
+        if record is None:
+            raise HTTPException(
+                status_code=404, detail=f"论文 {paper_id} 不存在或尚未撤回"
+            )
+    return {"paper_id": paper_id, "state": "withdrawn", "withdrawal": _withdrawal_view(record)}
 
 
 # ---------------------------------------------------------------- 评审人资料 (会务方)
@@ -755,6 +962,15 @@ def set_assignment_locks(body: LockTableIn, _: bool = Depends(require_organizer)
             for pid in locks
             if conn.execute("SELECT 1 FROM papers WHERE paper_id = ?", (pid,)).fetchone() is None
         )
+        # 撤回稿资料行保留但已不参与分配: 不可再对其提交普通分配锁定
+        withdrawn_papers = sorted(
+            pid
+            for pid in locks
+            if conn.execute(
+                "SELECT 1 FROM papers WHERE paper_id = ? AND withdrawn = 1", (pid,)
+            ).fetchone()
+            is not None
+        )
         unknown_reviewers = sorted({
             rid
             for ids in locks.values()
@@ -763,12 +979,13 @@ def set_assignment_locks(body: LockTableIn, _: bool = Depends(require_organizer)
                 "SELECT 1 FROM reviewers WHERE reviewer_id = ?", (rid,)
             ).fetchone() is None
         })
-        if unknown_papers or unknown_reviewers:
+        if unknown_papers or unknown_reviewers or withdrawn_papers:
             raise HTTPException(
                 status_code=404,
                 detail={
-                    "message": "锁定表包含未知论文或评审人, 整表拒绝且不改动当前锁定",
+                    "message": "锁定表包含未知/已撤回论文或未知评审人, 整表拒绝且不改动当前锁定",
                     "unknown_papers": unknown_papers,
+                    "withdrawn_papers": withdrawn_papers,
                     "unknown_reviewers": unknown_reviewers,
                 },
             )
@@ -884,7 +1101,11 @@ def publish(body: PublishIn, _: bool = Depends(require_organizer)):
 
 @app.get("/assignment")
 def get_published(_: bool = Depends(require_organizer)):
-    """会务方查询当前已发布方案、每个分配槽位的确认/回避状态及排除原因。"""
+    """会务方查询当前已发布方案、每个分配槽位的确认/回避状态及排除原因。
+
+    已撤回的论文仍保留在当前发布版视图中 (当前发布版不重写), 每篇带 withdrawn
+    标记并附撤回原因, 供会务方核对; 评审人侧则立即不可见、不可操作。
+    """
     with db.read_txn() as conn:
         row = _load_published(conn)
         if row is None:
@@ -892,6 +1113,17 @@ def get_published(_: bool = Depends(require_organizer)):
         decisions = _load_decisions(conn, row["serial"])
         plan = json.loads(row["plan"])
         papers = json.loads(row["explanations"])
+        withdrawn_paper_ids = {
+            r["paper_id"] for r in conn.execute(
+                "SELECT paper_id FROM papers WHERE withdrawn = 1"
+            ).fetchall()
+        }
+        withdrawal_reasons = {
+            r["paper_id"]: r["reason"]
+            for r in conn.execute(
+                "SELECT paper_id, reason FROM paper_withdrawals"
+            ).fetchall()
+        }
     for pid, pair in plan.items():
         slots = []
         for rid in pair:
@@ -904,13 +1136,17 @@ def get_published(_: bool = Depends(require_organizer)):
                     "decided_at": d["decided_at"] if d else None,
                 }
             )
+        is_withdrawn = pid in withdrawn_paper_ids
         papers.setdefault(pid, {"assigned": pair})["slots"] = slots
+        papers[pid]["withdrawn"] = is_withdrawn
+        papers[pid]["withdrawal_reason"] = withdrawal_reasons.get(pid) if is_withdrawn else None
     return {
         "serial": row["serial"],
         "revision": row["revision"],
         "published_at": row["published_at"],
         "plan": plan,
         "papers": papers,
+        "withdrawn_papers": sorted(pid for pid in plan if pid in withdrawn_paper_ids),
     }
 
 
@@ -924,6 +1160,8 @@ def paper_reviews(paper_id: str, _: bool = Depends(require_organizer)):
       (补位被移出槽位的评语仅供会务方追溯, 不计入新方案进度);
     - corrections 为该论文全部更正请求记录 (冻结的原评语与更正后内容, 供会务方追溯);
     - 被移出后同一评审人后来重新获得该稿时为新序号下的新槽位, 旧评语不会复用。
+    - 论文已撤回时: 该稿不再有当前有效槽位 (slots 为空), 已交评语、归档评语与
+      更正记录全部保留供会务方追溯, 响应附撤回记录。
     """
     with db.read_txn() as conn:
         row = _load_published(conn)
@@ -931,9 +1169,56 @@ def paper_reviews(paper_id: str, _: bool = Depends(require_organizer)):
             raise HTTPException(status_code=404, detail="尚未发布任何分配方案")
         serial = row["serial"]
         plan = json.loads(row["plan"])
+        paper = conn.execute(
+            "SELECT withdrawn FROM papers WHERE paper_id = ?", (paper_id,)
+        ).fetchone()
+        if paper is None:
+            raise HTTPException(status_code=404, detail=f"论文不存在: {paper_id}")
         pair = plan.get(paper_id)
         if not pair:
-            raise HTTPException(status_code=404, detail=f"当前发布版中不存在论文 {paper_id} 的分配")
+            if not paper["withdrawn"]:
+                raise HTTPException(
+                    status_code=404, detail=f"当前发布版中不存在论文 {paper_id} 的分配"
+                )
+            # 撤回稿 (尤其撤回后又重新发布过普通方案) 不再有当前槽位:
+            # 返回纯追溯视图, 全部评语/更正历史保留
+            archived_rows = conn.execute(
+                "SELECT serial, reviewer_id, score, comment, receipt, submitted_at"
+                " FROM submitted_reviews WHERE paper_id = ?"
+                " ORDER BY serial, reviewer_id",
+                (paper_id,),
+            ).fetchall()
+            archived = [
+                {
+                    "serial": r["serial"],
+                    "reviewer_id": r["reviewer_id"],
+                    "score": r["score"],
+                    "comment": r["comment"],
+                    "receipt": r["receipt"],
+                    "submitted_at": r["submitted_at"],
+                }
+                for r in archived_rows
+            ]
+            corrections = [
+                _correction_view(c)
+                for c in conn.execute(
+                    "SELECT * FROM review_corrections WHERE paper_id = ? ORDER BY id",
+                    (paper_id,),
+                ).fetchall()
+            ]
+            withdrawal = conn.execute(
+                "SELECT * FROM paper_withdrawals WHERE paper_id = ?", (paper_id,)
+            ).fetchone()
+            return {
+                "paper_id": paper_id,
+                "serial": serial,
+                "withdrawn": True,
+                "withdrawal": _withdrawal_view(withdrawal),
+                "progress": {"slots": 0, "confirmed": 0, "submitted": 0, "complete": False},
+                "slots": [],
+                "archived_reviews": archived,
+                "corrections": corrections,
+            }
         decisions = _load_decisions(conn, serial)
         reviews = _load_reviews(conn, serial)
         slots = []
@@ -989,11 +1274,16 @@ def paper_reviews(paper_id: str, _: bool = Depends(require_organizer)):
                 (paper_id,),
             ).fetchall()
         ]
+        withdrawal_row = conn.execute(
+            "SELECT * FROM paper_withdrawals WHERE paper_id = ?", (paper_id,)
+        ).fetchone()
     confirmed = sum(1 for s in slots if s["state"] == "confirmed")
     submitted = sum(1 for s in slots if s["submitted"])
     return {
         "paper_id": paper_id,
         "serial": serial,
+        "withdrawn": withdrawal_row is not None,
+        "withdrawal": _withdrawal_view(withdrawal_row) if withdrawal_row is not None else None,
         "progress": {
             "slots": len(slots),
             "confirmed": confirmed,
@@ -1038,6 +1328,14 @@ def _create_review_correction(conn, *, paper_id: str, serial: int, reviewer_id: 
     if not pair:
         raise HTTPException(
             status_code=404, detail=f"当前发布版中不存在论文 {paper_id} 的分配"
+        )
+    withdrawn = conn.execute(
+        "SELECT 1 FROM papers WHERE paper_id = ? AND withdrawn = 1", (paper_id,)
+    ).fetchone()
+    if withdrawn is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"论文 {paper_id} 已撤回, 不可再发起评语更正 (历史记录保留供追溯)",
         )
     if reviewer_id not in pair:
         raise HTTPException(
@@ -1220,6 +1518,14 @@ def publish_feedback_snapshot(
             raise HTTPException(
                 status_code=404,
                 detail=f"当前发布版中不存在论文 {paper_id} 的分配, 无法发布快照",
+            )
+        withdrawn = conn.execute(
+            "SELECT 1 FROM papers WHERE paper_id = ? AND withdrawn = 1", (paper_id,)
+        ).fetchone()
+        if withdrawn is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"论文 {paper_id} 已撤回, 不可再发布反馈快照 (历史版本保留供追溯)",
             )
         decisions = _load_decisions(conn, current_serial)
         reviews = _load_reviews(conn, current_serial)
@@ -1862,6 +2168,15 @@ def submit_decision(
                 status_code=404,
                 detail=f"当前发布版中论文 {paper_id} 未分配给 {reviewer_id}, 拒绝操作",
             )
+        withdrawn = conn.execute(
+            "SELECT 1 FROM papers WHERE paper_id = ? AND withdrawn = 1", (paper_id,)
+        ).fetchone()
+        if withdrawn is not None:
+            # 撤回稿立即停止确认/回避; 与未分配任务一致返回 404
+            raise HTTPException(
+                status_code=404,
+                detail=f"论文 {paper_id} 已撤回, 不再接受评审决定",
+            )
         serial = published["serial"]
         existing = conn.execute(
             "SELECT state, reason FROM assignment_decisions"
@@ -1951,7 +2266,16 @@ def reviewer_assignments(reviewer_id: str = Depends(require_active_reviewer)):
         serial = row["serial"]
         plan = json.loads(row["plan"])
         decisions = _load_decisions(conn, serial)
-        mine = sorted(pid for pid, rs in plan.items() if reviewer_id in rs)
+        withdrawn_paper_ids = {
+            r["paper_id"] for r in conn.execute(
+                "SELECT paper_id FROM papers WHERE withdrawn = 1"
+            ).fetchall()
+        }
+        mine = sorted(
+            pid
+            for pid, rs in plan.items()
+            if reviewer_id in rs and pid not in withdrawn_paper_ids
+        )
         out, recused, states = [], [], {}
         for pid in mine:
             d = decisions.get((pid, reviewer_id))
@@ -2026,6 +2350,15 @@ def submit_review(
             raise HTTPException(
                 status_code=404,
                 detail=f"当前发布版中论文 {paper_id} 未分配给 {reviewer_id}, 拒绝评语提交",
+            )
+        withdrawn = conn.execute(
+            "SELECT 1 FROM papers WHERE paper_id = ? AND withdrawn = 1", (paper_id,)
+        ).fetchone()
+        if withdrawn is not None:
+            # 撤回稿立即停止评语提交; 与未分配/被移出任务一致返回 404
+            raise HTTPException(
+                status_code=404,
+                detail=f"论文 {paper_id} 已撤回, 不再接受正式评语",
             )
         decision = conn.execute(
             "SELECT state FROM assignment_decisions"
@@ -2106,11 +2439,19 @@ def reviewer_reviews(reviewer_id: str = Depends(require_active_reviewer)):
         plan = json.loads(published["plan"])
         decisions = _load_decisions(conn, serial)
         reviews = _load_reviews(conn, serial)
+        withdrawn_paper_ids = {
+            r["paper_id"] for r in conn.execute(
+                "SELECT paper_id FROM papers WHERE withdrawn = 1"
+            ).fetchall()
+        }
         out = []
-        for pid in sorted(pid for pid, rs in plan.items() if reviewer_id in rs):
+        for pid in sorted(
+            pid for pid, rs in plan.items()
+            if reviewer_id in rs and pid not in withdrawn_paper_ids
+        ):
             d = decisions.get((pid, reviewer_id))
             if d is None or d["state"] != "confirmed":
-                continue  # pending/已回避/被移出的槽位均非本人当前有效任务
+                continue  # pending/已回避/撤回/被移出的槽位均非本人当前有效任务
             r = reviews.get((pid, reviewer_id))
             if r is None:
                 continue
@@ -2142,8 +2483,11 @@ def reviewer_correction_tasks(reviewer_id: str = Depends(require_active_reviewer
             return {"reviewer_id": reviewer_id, "serial": None, "corrections": []}
         serial = published["serial"]
         rows = conn.execute(
-            "SELECT * FROM review_corrections"
-            " WHERE serial = ? AND reviewer_id = ? AND state = 'pending' ORDER BY id",
+            "SELECT rc.* FROM review_corrections rc"
+            " JOIN papers p ON p.paper_id = rc.paper_id"
+            " WHERE rc.serial = ? AND rc.reviewer_id = ? AND rc.state = 'pending'"
+            " AND p.withdrawn = 0"
+            " ORDER BY rc.id",
             (serial, reviewer_id),
         ).fetchall()
     return {
@@ -2192,6 +2536,15 @@ def submit_review_correction(
                     f"发布序号已过期: 更正提交针对序号 {body.serial},"
                     f" 当前发布序号为 {current_serial}, 待更正请求已失效"
                 ),
+            )
+        withdrawn = conn.execute(
+            "SELECT 1 FROM papers WHERE paper_id = ? AND withdrawn = 1", (paper_id,)
+        ).fetchone()
+        if withdrawn is not None:
+            # 撤回稿立即停止更正; 按"无对应任务"返回 404
+            raise HTTPException(
+                status_code=404,
+                detail=f"论文 {paper_id} 已撤回, 不存在可提交更正的任务",
             )
         corr = conn.execute(
             "SELECT * FROM review_corrections"
