@@ -36,6 +36,13 @@
   已走既有评语更正请求流程) / expired(发布序号变化后未处理异议过期, 仅供会务方追溯);
   每次发布 (含补位发布) 推进发布序号时, 旧序号下仍 pending 的异议在同一事务内
   原子标记 expired, 历史行永久保留;
+- paper_withdrawals 表保存会务方撤回论文的记录 (撤回为终态, 同编号不能重新录入);
+  撤回在同一个写事务内生效: 该稿立即停止评审人取稿/确认/回避/提交评语/更正,
+  现有作者反馈访问码失效 (feedback_snapshots.invalidated 置 1), 待处理异议同事务
+  标记过期 (原查询凭据仍可查状态), 其普通分配锁定级联清除 (不得阻塞其他论文);
+  已处理异议和评语、快照、分配历史均保留供会务方追溯;
+  后续普通分配与补位跳过撤回稿; 仅有效撤回推进资料修订号,
+  匹配当前修订号的同原因重试幂等返回原记录、不推进修订号;
 - 发布 = 在同一个写事务内 "校验修订号 -> 重算 -> 写入",
   因此与资料修改并发时不会产生基于旧版资料的方案。
 """
@@ -222,6 +229,20 @@ CREATE TABLE IF NOT EXISTS feedback_objections (
     decided_at         TEXT,                -- 驳回/受理时间; 序号变化过期时同事务写入
     UNIQUE (snapshot_id, label)
 );
+-- 会务方撤回论文的记录 (撤回为终态; 同编号不能重新录入)。
+-- 撤回在同一个写事务内生效: 该稿立即停止评审人取稿/确认/回避/提交评语/更正,
+-- 该稿现有作者反馈访问码立即失效 (feedback_snapshots.invalidated 置 1),
+-- 该稿仍 pending 的异议在同一事务内标记过期 (decided_at 写入撤回时间, 历史保留),
+-- 该稿的普通分配锁定随撤回级联清除 (锁定不得阻塞其他论文);
+-- 已处理异议和评语、快照、分配历史均不删除, 保留供会务方追溯;
+-- 后续普通分配与补位求解跳过撤回稿。仅有效撤回写入记录并推进资料修订号;
+-- 匹配当前修订号的同原因重试幂等返回原记录 (不推进修订号), 异原因按冲突拒绝。
+CREATE TABLE IF NOT EXISTS paper_withdrawals (
+    paper_id     TEXT PRIMARY KEY,   -- 撤回的论文编号 (幂等键; 同编号不能重新录入)
+    reason       TEXT NOT NULL,      -- 会务方填写的非空撤回原因
+    revision     INTEGER NOT NULL,   -- 本次撤回推进后的资料修订号
+    withdrawn_at TEXT NOT NULL
+);
 """
 
 
@@ -353,6 +374,28 @@ def expire_pending_objections(conn: sqlite3.Connection, new_serial: int, now: st
         "UPDATE feedback_objections SET state = 'expired', decided_at = ?"
         " WHERE state = 'pending' AND serial < ?",
         (now, new_serial),
+    ).rowcount
+
+
+def load_withdrawn_paper_ids(conn: sqlite3.Connection):
+    """当前已撤回的论文编号集合 (撤回为终态, 记录永久保留; 同编号不能重新录入)。"""
+    return {
+        r["paper_id"]
+        for r in conn.execute("SELECT paper_id FROM paper_withdrawals").fetchall()
+    }
+
+
+def expire_pending_objections_for_paper(
+    conn: sqlite3.Connection, paper_id: str, now: str
+) -> int:
+    """撤回论文时, 在同一写事务内把该稿仍 pending 的异议标记过期 (历史保留, 凭据仍可查)。
+
+    已驳回/已受理的异议为终态, 不改动。返回本次标记过期的异议条数。
+    """
+    return conn.execute(
+        "UPDATE feedback_objections SET state = 'expired', decided_at = ?"
+        " WHERE state = 'pending' AND paper_id = ?",
+        (now, paper_id),
     ).rowcount
 
 
